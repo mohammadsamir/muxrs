@@ -1,16 +1,15 @@
 use anyhow::{Context, Result};
+use futures::channel::mpsc::{self, Receiver, Sender};
 use futures::future::{poll_fn, Either};
+use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt};
 use log::trace;
 use log::{debug, error};
-use parking_lot::Mutex as SyncMutex;
-use parking_lot::RwLock as SyncRwLock;
+use parking_lot::Mutex;
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll, Waker};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::{mpsc, Mutex, RwLock};
 
 use crate::frame::Frame;
 use crate::header::{Flag, FrameType};
@@ -49,8 +48,8 @@ pub struct MuxSession<T: AsyncRead + AsyncWrite> {
     outbound_writer: Sender<(MuxHeader, Vec<u8>)>,
     outbound_reader: Mutex<Receiver<(MuxHeader, Vec<u8>)>>,
     streams: RwLock<HashMap<u32, Stream>>,
-    inbound_streams: Arc<SyncMutex<Vec<Stream>>>,
-    inbound_waker: SyncRwLock<Option<Waker>>,
+    inbound_streams: Arc<Mutex<Vec<Stream>>>,
+    inbound_waker: RwLock<Option<Waker>>,
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> MuxSession<T> {
@@ -62,12 +61,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> MuxSession<T> {
             outbound_writer,
             outbound_reader: Mutex::new(outbound_reader),
             streams: RwLock::new(HashMap::new()),
-            inbound_streams: Arc::new(SyncMutex::new(Vec::new())),
-            inbound_waker: SyncRwLock::new(None),
+            inbound_streams: Arc::new(Mutex::new(Vec::new())),
+            inbound_waker: RwLock::new(None),
         };
-        let session = Arc::new(session);
-        tokio::spawn(session.clone().run());
-        session
+        Arc::new(session)
     }
 
     pub async fn open(&self, mode: MuxMode) -> Stream {
@@ -112,14 +109,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> MuxSession<T> {
         let stream = Stream::new(final_id).await;
         let mut cloned = stream.clone();
         cloned.set_outbound_writer(self.outbound_writer.clone());
-        self.streams.write().await.insert(final_id, stream);
+        self.streams.write().insert(final_id, stream);
 
         cloned
     }
 
     async fn inbound_write(&self, frame: Frame) -> Result<usize> {
         {
-            let streams = self.streams.read().await;
+            let streams = self.streams.read();
             match streams.get(&frame.header().id()) {
                 Some(stream) => return stream.write_to_buffer(frame).await,
                 None => {}
@@ -145,7 +142,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> MuxSession<T> {
             }
         }
 
-        let streams = self.streams.read().await;
+        let streams = self.streams.read();
         streams
             .get(&frame.header().id())
             .unwrap()
@@ -172,20 +169,19 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> MuxSession<T> {
     async fn poll_channel(&self) -> Result<(MuxHeader, Vec<u8>)> {
         self.outbound_reader
             .lock()
-            .await
-            .recv()
+            .next()
             .await
             .context("channel closed")
     }
 
     async fn write_io(&self, bytes: &[u8]) -> Result<usize> {
         trace!("writing io {:?}", bytes);
-        let mut socket = self.inner.lock().await;
+        let mut socket = self.inner.lock();
         socket.write(bytes).await.map_err(|e| anyhow::Error::new(e))
     }
 
     async fn poll_io(&self) -> Result<Frame> {
-        let mut socket = self.inner.lock().await;
+        let mut socket = self.inner.lock();
         let mut buf = [0u8; HEADER_LENGTH];
         match socket.read_exact(&mut buf).await {
             Ok(_) => {

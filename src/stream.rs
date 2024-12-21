@@ -1,19 +1,14 @@
 use anyhow::Result;
+use futures::channel::mpsc::Sender;
+use futures::{AsyncRead, AsyncReadExt, AsyncWrite};
 use log::trace;
-use std::future::Future;
+use parking_lot::Mutex;
 use std::io::Write;
 use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use std::task::{Context, Poll, Waker};
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWrite;
-use tokio::io::{self, AsyncRead, ReadBuf};
-use tokio::pin;
-use tokio::sync::mpsc::Sender;
-use tokio::sync::Mutex;
 
 use crate::frame::Frame;
 use crate::header::Flag;
@@ -39,7 +34,7 @@ pub struct Stream {
     id: u32,
     in_buf: Arc<Mutex<Vec<u8>>>,
     writer: Option<Sender<(MuxHeader, Vec<u8>)>>,
-    shared: Arc<StdMutex<Shared>>,
+    shared: Arc<Mutex<Shared>>,
     ready: Arc<AtomicBool>,
 }
 
@@ -62,7 +57,7 @@ impl Stream {
             id,
             in_buf: buf.clone(),
             writer: None,
-            shared: Arc::new(StdMutex::new(Shared::new())),
+            shared: Arc::new(Mutex::new(Shared::new())),
             ready: Arc::new(AtomicBool::new(false)),
         };
         stream
@@ -77,7 +72,7 @@ impl Stream {
     }
 
     pub async fn write_to_buffer(&self, frame: Frame) -> Result<usize> {
-        let mut buf = self.in_buf.lock().await;
+        let mut buf = self.in_buf.lock();
         if frame.header().len() == 0 && frame.is_syn() {
             drop(buf);
             trace!("SYN FRAME; SKIPPING");
@@ -95,25 +90,24 @@ impl Stream {
         res
     }
 
-    pub(crate) async fn write_frame(&mut self, frame: Frame) -> Result<(), ()> {
+    pub(crate) async fn write_frame(&mut self, frame: Frame) -> Result<()> {
         let (header, bytes) = frame.split();
         self.writer
-            .as_ref()
+            .as_mut()
             .unwrap()
-            .send((header, bytes))
-            .await
-            .map_err(|_| ())
+            .try_send((header, bytes))
+            .map_err(|e| anyhow::Error::new(e))
     }
 
     pub fn wake(&self) {
-        let shared = self.shared.lock().unwrap();
+        let shared = self.shared.lock();
         if shared.waker.is_some() {
             shared.waker.as_ref().unwrap().wake_by_ref();
         }
     }
 
     pub fn wake_write(&self) {
-        let shared = self.shared.lock().unwrap();
+        let shared = self.shared.lock();
         if shared.write_waker.is_some() {
             shared.write_waker.as_ref().unwrap().wake_by_ref();
         }
@@ -134,23 +128,20 @@ impl AsyncRead for Stream {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        match self.in_buf.try_lock() {
-            Ok(mut b) => {
-                if b.len() > 0 {
-                    if b.len() > buf.remaining() {
-                        buf.put_slice(&b.drain(0..buf.remaining()).collect::<Vec<u8>>());
-                    } else {
-                        buf.put_slice(&b);
-                        *b = vec![];
-                    }
-                    return Poll::Ready(Ok(()));
-                }
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let mut b = self.in_buf.lock();
+        let len = b.len();
+        if b.len() > 0 {
+            if b.len() > buf.len() {
+                buf.copy_from_slice(&b.drain(0..buf.len()).collect::<Vec<u8>>());
+            } else {
+                buf.copy_from_slice(&b);
+                *b = vec![];
             }
-            _ => {}
+            return Poll::Ready(Ok(len));
         }
-        let mut shared = self.shared.lock().unwrap();
+        let mut shared = self.shared.lock();
         shared.waker = Some(cx.waker().to_owned());
         return Poll::Pending;
     }
@@ -159,13 +150,13 @@ impl AsyncRead for Stream {
 // only used externally. always assume data frames and inject headers
 impl AsyncWrite for Stream {
     fn poll_write(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> Poll<Result<usize, io::Error>> {
+    ) -> Poll<std::io::Result<usize>> {
         if !self.ready.load(Ordering::Relaxed) {
             trace!("stream {} is not ready for writes", { self.id() });
-            let mut shared = self.shared.lock().unwrap();
+            let mut shared = self.shared.lock();
             shared.write_waker = Some(cx.waker().to_owned());
 
             return Poll::Pending;
@@ -176,22 +167,22 @@ impl AsyncWrite for Stream {
             Some(Flag::Syn),
             Some(FrameType::Data),
         );
-        let send = self.writer.as_ref().unwrap().send((header, buf.to_vec()));
-        pin!(send);
-        match send.poll(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(sent) => Poll::Ready(
-                sent.map(|_| buf.len() + HEADER_LENGTH)
-                    .map_err(|e| io::Error::other(e)),
-            ),
+        match self
+            .writer
+            .as_mut()
+            .unwrap()
+            .try_send((header, buf.to_vec()))
+        {
+            Ok(_) => Poll::Ready(Ok(buf.len() + HEADER_LENGTH)),
+            Err(_) => Poll::Pending,
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+    fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 }

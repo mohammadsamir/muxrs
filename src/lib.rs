@@ -6,13 +6,14 @@ mod stream;
 #[cfg(test)]
 mod tests {
     use crate::session::{MuxMode, MuxSession};
+    use futures::AsyncWriteExt;
     use log::info;
     use std::time::Duration;
     use tokio::{
-        io::AsyncWriteExt,
         net::{TcpListener, TcpStream},
         time::sleep,
     };
+    use tokio_util::compat::TokioAsyncReadCompatExt;
 
     #[tokio::test]
     async fn server() {
@@ -22,8 +23,8 @@ mod tests {
         loop {
             let (socket, _) = listener.accept().await.unwrap();
 
-            let session = MuxSession::new(socket).await;
-
+            let session = MuxSession::new(socket.compat()).await;
+            let cloned = session.clone();
             let mut stream = session.open(MuxMode::Server).await;
             tokio::spawn(async move {
                 loop {
@@ -31,7 +32,7 @@ mod tests {
                         .write("ping".as_bytes())
                         .await
                         .expect("failed to write to stream");
-                    info!("frame sent from stream {}", stream.id());
+                    info!("frame sent to stream {}", stream.id());
                     sleep(Duration::from_millis(1000)).await;
                 }
             });
@@ -47,6 +48,7 @@ mod tests {
                     });
                 }
             });
+            cloned.run().await
         }
     }
 
@@ -55,18 +57,18 @@ mod tests {
         env_logger::init();
 
         let socket = TcpStream::connect("127.0.0.1:5000").await.unwrap();
-        let session = MuxSession::new(socket).await;
-
+        let session = MuxSession::new(socket.compat()).await;
+        let cloned = session.clone();
         let mut stream_a = session.open(MuxMode::Client).await;
         let mut stream_b = session.open(MuxMode::Client).await;
 
-        let a = tokio::spawn(async move {
+        tokio::spawn(async move {
             loop {
                 stream_a
                     .write("ping".as_bytes())
                     .await
                     .expect("failed to write to stream");
-                info!("frame sent from stream {}", stream_a.id());
+                info!("frame sent to stream {}", stream_a.id());
                 sleep(Duration::from_millis(1000)).await;
             }
         });
@@ -77,7 +79,7 @@ mod tests {
                     .write("ping".as_bytes())
                     .await
                     .expect("failed to write to stream");
-                info!("frame sent from stream {}", stream_b.id());
+                info!("frame sent to stream {}", stream_b.id());
                 sleep(Duration::from_millis(1000)).await;
             }
         });
@@ -93,7 +95,6 @@ mod tests {
                 });
             }
         });
-
-        let _ = a.await;
+        cloned.run().await;
     }
 }
